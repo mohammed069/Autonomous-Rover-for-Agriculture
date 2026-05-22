@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Deque, List, Optional
 
 from environment import FarmEnvironment, TargetInfo
+from pathfinding import astar
 from qlearning import QLearningAgent
 from utils import Action, Cell, CellType, action_name, manhattan_distance
 
@@ -44,6 +45,7 @@ class Rover:
     recent_positions: Deque[Cell] = field(default_factory=lambda: deque(maxlen=8))
     step_count: int = 0
     total_steps: int = 0
+    visited_cells: set[Cell] = field(default_factory=set)
 
     def reset(self, position: Cell) -> None:
         self.position = position
@@ -55,26 +57,50 @@ class Rover:
         self.heading = (0, 1)
         self.recent_positions.clear()
         self.recent_positions.append(position)
+        self.visited_cells.clear()
+        self.visited_cells.add(position)
 
-    def step(self, env: FarmEnvironment, agent: QLearningAgent, training: bool = True) -> tuple[tuple, tuple, RoverStepResult]:
+    def step(self, env: FarmEnvironment, agent: QLearningAgent, training: bool = True, mode: str = "task", advance_environment: bool = True) -> tuple[tuple, tuple, RoverStepResult]:
         observation = env.observe(self.position)
         state = observation.state
-        nearest_weed, nearest_dry, preferred_target = env.scan_targets(self.position)
-
-        if preferred_target is None:
-            chosen_action = Action.IDLE
-            preferred_action = Action.IDLE
-        elif preferred_target.position == self.position:
-            preferred_action = Action.REMOVE_WEED if preferred_target.kind == "Weed" else Action.WATER
-            chosen_action = preferred_action
+        preferred_target: Optional[TargetInfo]
+        if mode == "discover":
+            current_cell_type = env.describe_cell(self.position)
+            if current_cell_type == "Weed":
+                preferred_target = TargetInfo(kind="Weed", position=self.position, path=[self.position])
+                chosen_action = Action.REMOVE_WEED
+                preferred_action = Action.REMOVE_WEED
+            elif current_cell_type == "Dry Soil":
+                preferred_target = TargetInfo(kind="Dry Soil", position=self.position, path=[self.position])
+                chosen_action = Action.WATER
+                preferred_action = Action.WATER
+            else:
+                discovery_target = self._nearest_unvisited_target(env)
+                if discovery_target is None:
+                    preferred_target = None
+                    chosen_action = Action.IDLE
+                    preferred_action = Action.IDLE
+                else:
+                    preferred_target = discovery_target
+                    chosen_action = Action.MOVE
+                    preferred_action = Action.MOVE
         else:
-            preferred_action = Action.MOVE
-            chosen_action = agent.select_action(
-                state,
-                legal_actions=[Action.MOVE, Action.IDLE],
-                preferred_action=preferred_action,
-                explore=training,
-            )
+            _, _, preferred_target = env.scan_targets(self.position)
+
+            if preferred_target is None:
+                chosen_action = Action.IDLE
+                preferred_action = Action.IDLE
+            elif preferred_target.position == self.position:
+                preferred_action = Action.REMOVE_WEED if preferred_target.kind == "Weed" else Action.WATER
+                chosen_action = preferred_action
+            else:
+                preferred_action = Action.MOVE
+                chosen_action = agent.select_action(
+                    state,
+                    legal_actions=[Action.MOVE, Action.IDLE],
+                    preferred_action=preferred_action,
+                    explore=training,
+                )
 
         reward = 0.0
         actual_action = action_name(chosen_action)
@@ -105,6 +131,7 @@ class Rover:
             elif status in ("planned route blocked", "no valid move"):
                 reward += env.collision_penalty()
             self.position = next_position
+            self.visited_cells.add(self.position)
             actual_action = "MOVE"
         elif chosen_action in (Action.WATER, Action.REMOVE_WEED, Action.IDLE):
             reward_delta, status, completed, task_kind = env.execute_task(self.position, chosen_action)
@@ -118,13 +145,16 @@ class Rover:
             if chosen_action == Action.IDLE:
                 self.idle_actions += 1
             actual_action = action_name(chosen_action)
+            if mode == "discover":
+                self.visited_cells.add(self.position)
         else:
             reward += -1.0
 
-        env.update_dynamics()
+        if advance_environment:
+            env.update_dynamics()
         self.step_count += 1
         self.total_steps += 1
-        done = env.remaining_tasks() == 0
+        done = env.remaining_tasks() == 0 if mode != "discover" else preferred_target is None
 
         learning_reward = reward
 
@@ -144,6 +174,26 @@ class Rover:
             done=done,
         )
         return state, next_state, result
+
+    def _nearest_unvisited_target(self, env: FarmEnvironment) -> Optional[TargetInfo]:
+        candidates: list[tuple[int, TargetInfo]] = []
+        for x in range(env.grid_size):
+            for y in range(env.grid_size):
+                position = (x, y)
+                if position in self.visited_cells:
+                    continue
+                if not env.walkable(position):
+                    continue
+                path = astar(self.position, position, env.grid)
+                if not path:
+                    continue
+                candidates.append((len(path), TargetInfo(kind="Discovery", position=position, path=path)))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0][1]
 
     def _distance_to_target(self, position: Cell, target: Optional[TargetInfo]) -> int:
         if target is None:

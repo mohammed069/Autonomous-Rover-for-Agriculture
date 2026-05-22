@@ -23,7 +23,7 @@ from config import (
 from environment import FarmEnvironment
 from qlearning import QLearningAgent
 from rover import Rover
-from utils import Action, seed_everything
+from utils import Action, CellType, neighbors4, seed_everything
 from visualization import FarmVisualizer
 
 
@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=MAX_STEPS_PER_EPISODE, help="Maximum steps per episode")
     parser.add_argument("--grid-size", type=int, default=GRID_SIZE, help="Farm grid size")
     parser.add_argument("--seed", type=int, default=7, help="Random seed")
-    parser.add_argument("--skip-simulation", action="store_true", help="Train only and disable live visualization")
+    parser.add_argument("--skip-simulation", action="store_true", help="Train only and skip the post-training rover demo")
     return parser.parse_args()
 
 
@@ -42,6 +42,49 @@ def _clamped_efficiency(tasks_completed: int, total_task_budget: int) -> float:
         return 0.0
     calculated = (tasks_completed / total_task_budget) * 100.0
     return max(0.0, min(calculated, 100.0))
+
+
+def _reachable_cells(env: FarmEnvironment, start: tuple[int, int]) -> set[tuple[int, int]]:
+    reachable: set[tuple[int, int]] = set()
+    frontier = [start]
+    while frontier:
+        current = frontier.pop()
+        if current in reachable:
+            continue
+        reachable.add(current)
+        for neighbor in neighbors4(current, env.grid_size):
+            if neighbor in reachable:
+                continue
+            if CellType(env.grid[neighbor]) == CellType.OBSTACLE:
+                continue
+            frontier.append(neighbor)
+    return reachable
+
+
+def _largest_walkable_component(env: FarmEnvironment) -> tuple[tuple[int, int], set[tuple[int, int]]]:
+    walkable_cells = {
+        (x, y)
+        for x in range(env.grid_size)
+        for y in range(env.grid_size)
+        if CellType(env.grid[x, y]) != CellType.OBSTACLE
+    }
+    if not walkable_cells:
+        return env.rover_start, {env.rover_start}
+
+    best_start = env.rover_start
+    best_component: set[tuple[int, int]] = set()
+    remaining = set(walkable_cells)
+
+    while remaining:
+        start = remaining.pop()
+        component = _reachable_cells(env, start)
+        component &= walkable_cells
+        if len(component) > len(best_component):
+            best_start = start
+            best_component = component
+        remaining -= component
+
+    return best_start, best_component or {best_start}
 
 
 def train(agent: QLearningAgent, env: FarmEnvironment, rover: Rover, episodes: int, max_steps: int, visualizer: FarmVisualizer | None = None) -> tuple[List[float], int, Dict[str, float]]:
@@ -63,6 +106,7 @@ def train(agent: QLearningAgent, env: FarmEnvironment, rover: Rover, episodes: i
         episode_step_reward = 0.0
         start_tasks_completed = rover.tasks_completed
         start_collisions = rover.collisions
+        start_avoided_collisions = rover.avoided_collisions
         episode_success = False
 
         for step_index in range(max_steps):
@@ -107,7 +151,7 @@ def train(agent: QLearningAgent, env: FarmEnvironment, rover: Rover, episodes: i
             success_count += 1
 
         tasks_per_episode.append(rover.tasks_completed - start_tasks_completed)
-        collision_delta_per_episode.append(rover.collisions - start_collisions)
+        collision_delta_per_episode.append((rover.collisions + rover.avoided_collisions) - (start_collisions + start_avoided_collisions))
         reward_history.append(episode_reward)
         print(f"Episode {episode:03d}")
         print(f"Action: {episode_action.name}")
@@ -159,10 +203,66 @@ def plot_training_results(reward_history: List[float]) -> Path:
     return output_path
 
 
-def print_summary(reward_history: List[float], rover: Rover, total_task_budget: int, learning_stats: Dict[str, float]) -> None:
+def run_simulation(agent: QLearningAgent, env: FarmEnvironment, rover: Rover, reward_history: List[float]) -> int:
+    agent.set_greedy()
+    visualizer = FarmVisualizer(env.grid_size)
+
+    env.reset()
+    start_position, discovery_goal = _largest_walkable_component(env)
+    rover.reset(start_position)
+    discovery_budget = len(discovery_goal)
+
+    running = True
+    episode = 1
+    max_runtime_steps = max(MAX_STEPS, env.grid_size * env.grid_size * 4)
+
+    try:
+        for step_index in range(max_runtime_steps):
+            running = visualizer.handle_events()
+            if not running:
+                break
+
+            _, _, result = rover.step(env, agent, training=False, mode="discover", advance_environment=False)
+            rover.episode_reward += result.reward
+            cumulative_reward = rover.total_reward + rover.episode_reward
+            discovered_cells = len(rover.visited_cells & discovery_goal)
+            efficiency = _clamped_efficiency(discovered_cells, discovery_budget)
+            collision_rate = ((rover.collisions + rover.avoided_collisions) / max(1, rover.total_steps)) * 100.0
+            visualizer.draw(
+                env=env,
+                rover_position=rover.position,
+                rover_heading=rover.heading,
+                episode=episode,
+                current_step=f"{discovered_cells}/{discovery_budget} discovered",
+                episode_reward=rover.episode_reward,
+                total_reward=cumulative_reward,
+                current_action=result.actual_action,
+                tasks_completed=rover.tasks_completed,
+                current_target=f"{result.target} | Discovery",
+                efficiency=efficiency,
+                collision_rate=collision_rate,
+                target_position=result.target_position,
+                path=rover.current_path,
+                reward_history=reward_history,
+                learning_progress=1.0,
+                average_reward=sum(reward_history) / max(1, len(reward_history)),
+            )
+
+            if result.done or discovered_cells >= discovery_budget:
+                break
+    finally:
+        visualizer.close()
+
+    discovered_cells = len(rover.visited_cells & discovery_goal)
+    print(f"Discovery Episode Completed: {discovered_cells}/{discovery_budget} reachable cells discovered")
+
+    return discovery_budget
+
+
+def print_summary(reward_history: List[float], rover: Rover, total_task_budget: int, learning_stats: Dict[str, float], discovery_goal_count: int | None = None) -> None:
     average_reward = sum(reward_history) / max(1, len(reward_history))
     efficiency = _clamped_efficiency(rover.tasks_completed, total_task_budget)
-    collision_rate = (rover.collisions / max(1, rover.total_steps)) * 100.0
+    collision_rate = ((rover.collisions + rover.avoided_collisions) / max(1, rover.total_steps)) * 100.0
 
     print("Final Simulation Summary")
     print(f"Total Tasks Completed: {rover.tasks_completed}")
@@ -174,6 +274,11 @@ def print_summary(reward_history: List[float], rover: Rover, total_task_budget: 
     print(f"Collisions Handled: {rover.collisions}")
     print(f"Avoided Collisions: {rover.avoided_collisions}")
     print(f"Collision Rate: {collision_rate:.1f}%")
+    if discovery_goal_count is not None:
+        discovered_cells = len(rover.visited_cells)
+        discovery_coverage = (discovered_cells / max(1, discovery_goal_count)) * 100.0
+        print(f"Discovery Cells Visited: {discovered_cells}")
+        print(f"Discovery Coverage: {discovery_coverage:.1f}%")
     print(f"Avg Reward (Last 10 Episodes): {learning_stats['avg_reward_last_10']:+.1f}")
     print(f"Success Rate: {learning_stats['success_rate']:.1f}%")
     print(f"Avg Tasks per Episode: {learning_stats['tasks_per_episode']:.2f}")
@@ -213,7 +318,12 @@ def main() -> None:
     graph_path = plot_training_results(reward_history)
     print(f"Training graph saved to: {graph_path.resolve()}")
 
-    print_summary(reward_history, rover, training_task_budget, learning_stats)
+    if not args.skip_simulation:
+        print("Starting discovery simulation...")
+        simulation_task_budget = run_simulation(agent, env, rover, reward_history)
+        print_summary(reward_history, rover, training_task_budget, learning_stats, discovery_goal_count=simulation_task_budget)
+    else:
+        print_summary(reward_history, rover, training_task_budget, learning_stats)
 
 
 if __name__ == "__main__":
