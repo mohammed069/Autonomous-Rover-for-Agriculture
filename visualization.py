@@ -18,7 +18,7 @@ class FarmVisualizer:
         self.cell_size = cell_size
         self.panel_width = panel_width
         self.width = grid_size * cell_size + panel_width
-        self.height = grid_size * cell_size
+        self.height = grid_size * cell_size + 120
         self.screen = pygame.display.set_mode((self.width, self.height))
         pygame.display.set_caption("Autonomous Rover for Agriculture")
         self.font = pygame.font.SysFont("arial", 18)
@@ -148,7 +148,7 @@ class FarmVisualizer:
 
         self._draw_progress_bar(x_offset, y + 8, self.panel_width - 36, learning_progress)
         self._draw_legend(x_offset, y + 50)
-        self._draw_reward_sparkline(reward_history, x_offset, y + 116)
+        self._draw_reward_sparkline(reward_history, x_offset, y + 170)
 
     def _draw_progress_bar(self, x_offset: int, y_offset: int, width: int, progress: float) -> None:
         label = self.small_font.render("Training Progress", True, TEXT_COLOR)
@@ -182,7 +182,7 @@ class FarmVisualizer:
         self.screen.blit(title, (x_offset, y_offset))
         y_offset += 26
         width = self.panel_width - 36
-        height = 110
+        height = 75
         rect = pygame.Rect(x_offset, y_offset, width, height)
         pygame.draw.rect(self.screen, (38, 50, 42), rect, border_radius=8)
         pygame.draw.rect(self.screen, (78, 106, 84), rect, width=1, border_radius=8)
